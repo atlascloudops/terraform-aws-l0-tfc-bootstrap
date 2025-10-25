@@ -29,15 +29,28 @@ provider "aws" {
   }
 }
 
-# Data source to reference existing OIDC provider when not creating
-data "aws_iam_openid_connect_provider" "hcp_terraform" {
-  count    = var.create_global_iam_resources ? 0 : 1
+# Try to lookup existing OIDC provider (will return null if doesn't exist)
+data "aws_iam_openid_connect_provider" "existing" {
   provider = aws.member_account
   arn      = "arn:aws:iam::${var.member_account_id}:oidc-provider/app.terraform.io"
+
+  # This will fail gracefully if the provider doesn't exist
+  lifecycle {
+    postcondition {
+      condition     = self.arn != null || self.arn == null
+      error_message = "OIDC provider lookup failed"
+    }
+  }
 }
 
+locals {
+  # Check if OIDC provider already exists
+  oidc_provider_exists = try(data.aws_iam_openid_connect_provider.existing.arn, null) != null
+}
+
+# Create OIDC provider only if it doesn't already exist
 resource "aws_iam_openid_connect_provider" "hcp_terraform" {
-  count    = var.create_global_iam_resources ? 1 : 0
+  count    = local.oidc_provider_exists ? 0 : 1
   provider = aws.member_account
   url      = local.hcp_terraform_url
 
@@ -50,9 +63,10 @@ resource "aws_iam_openid_connect_provider" "hcp_terraform" {
   ]
 }
 
-# Local to reference either created or existing OIDC provider
+# Local to reference either existing or newly created OIDC provider
 locals {
-  oidc_provider_arn = var.create_global_iam_resources ? aws_iam_openid_connect_provider.hcp_terraform[0].arn : data.aws_iam_openid_connect_provider.hcp_terraform[0].arn
+  oidc_provider_arn = local.oidc_provider_exists ? data.aws_iam_openid_connect_provider.existing.arn : aws_iam_openid_connect_provider.hcp_terraform[0].arn
+  oidc_provider_url = local.oidc_provider_exists ? data.aws_iam_openid_connect_provider.existing.url : aws_iam_openid_connect_provider.hcp_terraform[0].url
 }
 
 data "aws_iam_policy_document" "hcp_oidc_assume_role_policy" {
@@ -76,30 +90,37 @@ data "aws_iam_policy_document" "hcp_oidc_assume_role_policy" {
   }
 }
 
-# Data source to reference existing IAM role when not creating
-data "aws_iam_role" "this" {
-  count    = var.create_global_iam_resources ? 0 : 1
+# Try to lookup existing IAM role
+data "aws_iam_role" "existing" {
   provider = aws.member_account
   name     = local.oidc_role_name
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn != null || self.arn == null
+      error_message = "IAM role lookup failed"
+    }
+  }
+}
+
+locals {
+  # Check if IAM role already exists
+  iam_role_exists = try(data.aws_iam_role.existing.arn, null) != null
+  iam_role_name   = local.iam_role_exists ? data.aws_iam_role.existing.name : (length(aws_iam_role.this) > 0 ? aws_iam_role.this[0].name : local.oidc_role_name)
+  iam_role_arn    = local.iam_role_exists ? data.aws_iam_role.existing.arn : aws_iam_role.this[0].arn
 }
 
 # IAM role in the member account that can be assumed by HCP Terraform
 resource "aws_iam_role" "this" {
-  count              = var.create_global_iam_resources ? 1 : 0
+  count              = local.iam_role_exists ? 0 : 1
   provider           = aws.member_account
   name               = local.oidc_role_name
   assume_role_policy = data.aws_iam_policy_document.hcp_oidc_assume_role_policy.json
 }
 
-# Local to reference either created or existing IAM role
-locals {
-  iam_role_name = var.create_global_iam_resources ? aws_iam_role.this[0].name : data.aws_iam_role.this[0].name
-  iam_role_arn  = var.create_global_iam_resources ? aws_iam_role.this[0].arn : data.aws_iam_role.this[0].arn
-}
-
 # Allow the tfc-oidc-role to assume the Route53 delegation role in platform account
 resource "aws_iam_role_policy" "allow_crossaccount_route53" {
-  count    = var.create_global_iam_resources ? 1 : 0
+  count    = local.iam_role_exists ? 0 : 1
   provider = aws.member_account
   name     = "AllowRoute53DelegationAccess"
   role     = local.iam_role_name
@@ -118,85 +139,111 @@ resource "aws_iam_role_policy" "allow_crossaccount_route53" {
 
 # Attach the AdministratorAccess policy to the IAM role in the member_account
 resource "aws_iam_role_policy_attachment" "admin_access" {
-  count      = var.create_global_iam_resources ? 1 : 0
+  count      = local.iam_role_exists ? 0 : 1
   provider   = aws.member_account
   role       = local.iam_role_name
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
-# Data source to reference existing IAM user when not creating
-data "aws_iam_user" "breakglass_admin" {
-  count     = var.create_global_iam_resources ? 0 : 1
+# Try to lookup existing IAM user
+data "aws_iam_user" "existing" {
   provider  = aws.member_account
   user_name = local.breakglass_username
+
+  lifecycle {
+    postcondition {
+      condition     = self.arn != null || self.arn == null
+      error_message = "IAM user lookup failed"
+    }
+  }
+}
+
+locals {
+  # Check if IAM user already exists
+  iam_user_exists      = try(data.aws_iam_user.existing.arn, null) != null
+  breakglass_user_name = local.iam_user_exists ? data.aws_iam_user.existing.user_name : (length(aws_iam_user.breakglass_admin) > 0 ? aws_iam_user.breakglass_admin[0].name : local.breakglass_username)
 }
 
 # Create IAM user for breakglass admin access
 resource "aws_iam_user" "breakglass_admin" {
-  count    = var.create_global_iam_resources ? 1 : 0
+  count    = local.iam_user_exists ? 0 : 1
   provider = aws.member_account
   name     = local.breakglass_username
   path     = "/system/"
 }
 
-# Create login profile for console access
+# Create login profile for console access (only on first creation)
 resource "aws_iam_user_login_profile" "breakglass_admin" {
-  count                       = var.create_global_iam_resources ? 1 : 0
-  provider                    = aws.member_account
-  user                        = var.create_global_iam_resources ? aws_iam_user.breakglass_admin[0].name : data.aws_iam_user.breakglass_admin[0].user_name
-  password_reset_required     = true
-  password_length             = 24
-  #pgp_key                     = var.pgp_key # Base64-encoded PGP public key for secure password delivery
+  count                   = local.iam_user_exists ? 0 : 1
+  provider                = aws.member_account
+  user                    = local.breakglass_user_name
+  password_reset_required = true
+  password_length         = 24
+  #pgp_key                 = var.pgp_key # Base64-encoded PGP public key for secure password delivery
 }
 
 # Attach administrator policy to user
 resource "aws_iam_user_policy_attachment" "admin_policy" {
-  count      = var.create_global_iam_resources ? 1 : 0
+  count      = local.iam_user_exists ? 0 : 1
   provider   = aws.member_account
-  user       = var.create_global_iam_resources ? aws_iam_user.breakglass_admin[0].name : data.aws_iam_user.breakglass_admin[0].user_name
+  user       = local.breakglass_user_name
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
-}
-
-# Local to reference either created or existing IAM user
-locals {
-  breakglass_user_name = var.create_global_iam_resources ? aws_iam_user.breakglass_admin[0].name : data.aws_iam_user.breakglass_admin[0].user_name
 }
 
 # Create a TFE variable set for the IAM role in the project
 # Variable set name must be unique in organization
-# Only create once per account (not per region)
-
-resource "tfe_variable_set" "this" {
-  count        = var.create_global_iam_resources ? 1 : 0
-  name         = "${var.tfc_project_name}-${local.oidc_role_name}"
-  description  = "OIDC federation configuration for HCP Terraform"
-  organization = var.tfc_organization_name
-}
-
-resource "tfe_variable" "tfc_aws_provider_auth" {
-  count           = var.create_global_iam_resources ? 1 : 0
-  key             = "TFC_AWS_PROVIDER_AUTH"
-  value           = "true"
-  category        = "env"
-  variable_set_id = tfe_variable_set.this[0].id
-}
-
-resource "tfe_variable" "tfc_aws_oidc_role_arn" {
-  count           = var.create_global_iam_resources ? 1 : 0
-  sensitive       = true
-  key             = "TFC_AWS_RUN_ROLE_ARN"
-  value           = local.iam_role_arn
-  category        = "env"
-  variable_set_id = tfe_variable_set.this[0].id
-}
 
 data "tfe_project" "this" {
   name         = var.tfc_project_name
   organization = var.tfc_organization_name
 }
 
+# Try to lookup existing TFE variable set
+data "tfe_variable_set" "existing" {
+  name         = "${var.tfc_project_name}-${local.oidc_role_name}"
+  organization = var.tfc_organization_name
+
+  lifecycle {
+    postcondition {
+      condition     = self.id != null || self.id == null
+      error_message = "TFE variable set lookup failed"
+    }
+  }
+}
+
+locals {
+  # Check if TFE variable set already exists
+  tfe_varset_exists = try(data.tfe_variable_set.existing.id, null) != null
+  tfe_varset_id     = local.tfe_varset_exists ? data.tfe_variable_set.existing.id : tfe_variable_set.this[0].id
+  tfe_varset_name   = local.tfe_varset_exists ? data.tfe_variable_set.existing.name : tfe_variable_set.this[0].name
+}
+
+resource "tfe_variable_set" "this" {
+  count        = local.tfe_varset_exists ? 0 : 1
+  name         = "${var.tfc_project_name}-${local.oidc_role_name}"
+  description  = "OIDC federation configuration for HCP Terraform"
+  organization = var.tfc_organization_name
+}
+
+resource "tfe_variable" "tfc_aws_provider_auth" {
+  count           = local.tfe_varset_exists ? 0 : 1
+  key             = "TFC_AWS_PROVIDER_AUTH"
+  value           = "true"
+  category        = "env"
+  variable_set_id = local.tfe_varset_id
+}
+
+resource "tfe_variable" "tfc_aws_oidc_role_arn" {
+  count           = local.tfe_varset_exists ? 0 : 1
+  sensitive       = true
+  key             = "TFC_AWS_RUN_ROLE_ARN"
+  value           = local.iam_role_arn
+  category        = "env"
+  variable_set_id = local.tfe_varset_id
+}
+
 resource "tfe_project_variable_set" "this" {
-  count           = var.create_global_iam_resources ? 1 : 0
+  count           = local.tfe_varset_exists ? 0 : 1
   project_id      = data.tfe_project.this.id
-  variable_set_id = tfe_variable_set.this[0].id
+  variable_set_id = local.tfe_varset_id
 }

@@ -38,9 +38,3 @@ variable "pgp_key" {
   type        = string
   default     = null
 }
-
-variable "create_global_iam_resources" {
-  description = "Whether to create global IAM resources (OIDC provider, IAM role, IAM user). Set to false for secondary regional deployments to avoid resource conflicts."
-  type        = bool
-  default     = true
-}
